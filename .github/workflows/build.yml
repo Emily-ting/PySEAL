@@ -1,0 +1,32 @@
+name: build-pyseal-artifact
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch Dockerfile (same as GHCR workflow)
+        run: |
+          if grep -q '^FROM ubuntu:16.10' Dockerfile; then
+            sed -i 's|^FROM ubuntu:16.10|FROM ubuntu:20.04|' Dockerfile
+          fi
+          sed -i 's|COPY /SEAL/|COPY SEAL/|g' Dockerfile || true
+          sed -i 's|COPY /SEALExamples|COPY SEALExamples|g' Dockerfile || true
+          sed -i 's|COPY /SEALPythonExamples|COPY SEALPythonExamples|g' Dockerfile || true
+          sed -i 's|COPY /SEALPython|COPY SEALPython|g' Dockerfile || true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build to local tar (no push)
+        run: |
+          docker buildx build --output type=docker,dest=pyseal.tar -f Dockerfile .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyseal-image
+          path: pyseal.tar
+          if-no-files-found: error
