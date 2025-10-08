@@ -1,0 +1,12 @@
+{
+  "HOSTNAME": "b1dd5d4d8634",
+  "PWD": "/work",
+  "HOME": "/root",
+  "PYTHONPATH": "/SEAL/SEALPython:/SEAL/bin",
+  "TERM": "xterm",
+  "SHLVL": "1",
+  "LD_LIBRARY_PATH": "/SEAL/bin:",
+  "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "_": "/usr/bin/python3",
+  "LC_CTYPE": "C.UTF-8"
+}

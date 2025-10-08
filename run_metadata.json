@@ -1,0 +1,61 @@
+{
+  "timestamp": "2025-10-01 11:11:44",
+  "python": "3.8.10 (default, Mar 18 2025, 20:04:55) \n[GCC 9.4.0]",
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.29",
+  "machine": "x86_64",
+  "processor": "x86_64",
+  "seal_module": "/SEAL/SEALPython/seal.cpython-38-x86_64-linux-gnu.so",
+  "argv": [
+    "bench_pyseal_rich.py",
+    "--scheme",
+    "all",
+    "--repeat",
+    "30",
+    "--poly-degree",
+    "8192",
+    "--csv",
+    "results.csv",
+    "--meta",
+    "run_metadata.json",
+    "--dump-env",
+    "env_dump.json"
+  ],
+  "params": {
+    "repeat": 30,
+    "bfv_poly_degree": 8192,
+    "bfv_plain_mod": 65536,
+    "coeff_mod_bits": 2048,
+    "scale_bits": 40,
+    "dp_epsilon": 1.0,
+    "run_scheme": "all"
+  },
+  "os_release": {
+    "NAME": "Ubuntu",
+    "VERSION": "20.04.6 LTS (Focal Fossa)",
+    "ID": "ubuntu",
+    "ID_LIKE": "debian",
+    "PRETTY_NAME": "Ubuntu 20.04.6 LTS",
+    "VERSION_ID": "20.04",
+    "HOME_URL": "https://www.ubuntu.com/",
+    "SUPPORT_URL": "https://help.ubuntu.com/",
+    "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+    "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+    "VERSION_CODENAME": "focal",
+    "UBUNTU_CODENAME": "focal"
+  },
+  "cpuinfo": {
+    "model_name": "Intel(R) Core(TM) 7 150U",
+    "cpu_mhz": 2611.213,
+    "cores_logical": 12
+  },
+  "env_selected": {
+    "PYTHONPATH": "/SEAL/SEALPython:/SEAL/bin",
+    "LD_LIBRARY_PATH": "/SEAL/bin:",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME": "/root",
+    "PWD": "/work"
+  },
+  "ckks_present": false,
+  "keygen_time_s": 0.16028994899988902,
+  "relin_gen_time_s": 0.28565181700014364
+}
