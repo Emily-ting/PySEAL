@@ -81,6 +81,51 @@ def try_decode_int(encoder, plain) -> Optional[int]:
     except Exception:
         return None
 
+# ---- HE aggregation helpers (legacy-friendly) ----
+def he_encrypt_int(enc, encryptor, v:int):
+    pt = enc.encode(int(v))
+    ct = Ciphertext()
+    encryptor.encrypt(pt, ct)
+    return ct
+
+def he_sum_ciphertexts(evaluator, cts):
+    if not cts:
+        raise ValueError("no ciphertexts")
+    acc = cts[0]
+    for ct in cts[1:]:
+        out = Ciphertext()
+        evaluator.add(acc, ct, out)
+        acc = out
+    return acc
+
+def he_histogram_no_batch(enc, encryptor, evaluator, decryptor, user_bins, K:int, decode_fn):
+    # 每位使用者上傳 K 個密文（one-hot）
+    def enc_one_hot(idx, K):
+        row=[]
+        for b in range(K):
+            pt = enc.encode(1 if b==idx else 0)
+            c  = Ciphertext()
+            encryptor.encrypt(pt, c)
+            row.append(c)
+        return row
+
+    rows = [enc_one_hot(i, K) for i in user_bins]
+
+    # 雲端逐 bin 相加
+    agg = [rows[0][b] for b in range(K)]
+    for r in rows[1:]:
+        for b in range(K):
+            out = Ciphertext()
+            evaluator.add(agg[b], r[b], out)
+            agg[b] = out
+
+    # 解密
+    counts = []
+    for b in range(K):
+        pt = Plaintext(); decryptor.decrypt(agg[b], pt)
+        counts.append(decode_fn(pt))
+    return counts
+
 # -------------------- DP baseline --------------------
 def laplace_noise(scale: float) -> float:
     u = random.random() - 0.5
@@ -478,6 +523,11 @@ def main():
     ap.add_argument("--csv", default="pyseal_benchmark_results.csv", help="Output CSV file for timings.")
     ap.add_argument("--meta", default="run_metadata.json", help="Output JSON file for run metadata.")
     ap.add_argument("--dump-env", default=None, help="If set, write ALL environment variables to this JSON path.")
+    ap.add_argument("--agg", choices=["none","sum","mean","hist","all"], default="none", help="Run HE private aggregation demos on BFV context.")
+    ap.add_argument("--agg-n-users", type=int, default=100, help="Number of users (ciphertexts) to aggregate.")
+    ap.add_argument("--agg-max-value", type=int, default=50, help="Each user's value is in [0, agg-max-value].")
+    ap.add_argument("--agg-bins", type=int, default=8, help="Number of histogram bins (no BatchEncoder version).")
+    ap.add_argument("--agg-seed", type=int, default=123, help="Random seed for reproducibility.")
     args = ap.parse_args()
 
     rows = []
@@ -513,6 +563,138 @@ def main():
             size_row.update({f"size_{k}": (v if v is not None else "") for k,v in res["sizes"].items()})
             rows.append(size_row)
 
+            # === HE Private Aggregation (sum/mean/hist) on BFV ===
+            if args.agg != "none" and bfv_env:
+                import random
+                random.seed(args.agg_seed)
+
+                enc = bfv_env["encoder"]
+                encryptor = bfv_env["encryptor"]
+                decryptor = bfv_env["decryptor"]
+                evaluator = bfv_env["evaluator"]
+
+                # 建議檢查：plain_mod 是否 > n * max_value（避免 sum 取模回繞）
+                if args.plain_mod <= args.agg_n_users * args.agg_max_value:
+                    print("[HE-AGG][WARN] plain_mod may be too small for sum without wrap-around.")
+
+                # 資料：數值與類別（直方圖）
+                vals = [random.randint(0, args.agg_max_value) for _ in range(args.agg_n_users)]
+                bins = [random.randrange(args.agg_bins) for _ in range(args.agg_n_users)]
+
+                # 小工具：統計
+                def stats(arr):
+                    arr = sorted(arr)
+                    n = len(arr)
+                    return {
+                        "median_s": arr[n//2] if n else float("nan"),
+                        "mean_s": sum(arr)/n if n else float("nan"),
+                        "p90_s": arr[int(0.9*(n-1))] if n else float("nan"),
+                        "repeat": n
+                    }
+                def row(op, s):  # 寫入 CSV 的一行（沿用既有 rows）
+                    rows.append({"scheme":"BFV","op":op, **s})
+
+                # ---- SUM ----
+                if args.agg in ("sum","mean","all"):
+                    print("\n[HE-AGG] SUM")
+                    # 加密（逐用戶量測）
+                    enc_times = []
+                    cts = []
+                    for v in vals:
+                        pt = enc.encode(int(v))
+                        ct = Ciphertext()
+                        t0 = time.perf_counter()
+                        encryptor.encrypt(pt, ct)
+                        enc_times.append(time.perf_counter() - t0)
+                        cts.append(ct)
+                    enc_stat = stats(enc_times)
+                    print("  encrypt/user  median/mean/p90 (s): %.6f %.6f %.6f" %
+                          (enc_stat["median_s"], enc_stat["mean_s"], enc_stat["p90_s"]))
+                    row("agg_sum_encrypt_per_user", enc_stat)
+
+                    # 雲端相加（總時間）
+                    t0 = time.perf_counter()
+                    Csum = he_sum_ciphertexts(evaluator, cts)
+                    add_total = time.perf_counter() - t0
+                    print("  server-add total (s): %.6f  (adds=%d)" % (add_total, max(0, len(cts)-1)))
+                    rows.append({"scheme":"BFV","op":"agg_sum_server_add_total","total_s":add_total,"n_adds":max(0,len(cts)-1)})
+
+                    # 解密（一次）
+                    t0 = time.perf_counter()
+                    pt_sum = Plaintext(); decryptor.decrypt(Csum, pt_sum)
+                    he_sum = try_decode_int(enc, pt_sum)
+                    dec_t = time.perf_counter() - t0
+                    print("  decrypt (s): %.6f  | HE sum=%s  vs true=%s" % (dec_t, he_sum, sum(vals)))
+                    rows.append({"scheme":"BFV","op":"agg_sum_decrypt","total_s":dec_t})
+
+                    # ---- MEAN（在解密端除以 n）----
+                    if args.agg in ("mean","all"):
+                        he_mean = he_sum / float(len(vals))
+                        true_mean = sum(vals)/float(len(vals))
+                        print("  HE mean=%.6f  vs true mean=%.6f" % (he_mean, true_mean))
+                        rows.append({"scheme":"BFV","op":"agg_mean_result","mean_value":he_mean,"true_mean":true_mean,"n":len(vals)})
+
+                # ---- HISTOGRAM（無 BatchEncoder 版）----
+                if args.agg in ("hist","all"):
+                    print("\n[HE-AGG] HISTOGRAM (no BatchEncoder)")
+                    # 加密 one-hot（總時間）
+                    t0 = time.perf_counter()
+                    # 注意：he_histogram_no_batch 內部本來會自己加密；為了量時間，我們拆成兩階段：
+                    # 1) 先加密 (每人 K 個密文) 計時
+                    K = args.agg_bins
+                    rows_enc = []
+                    for idx in bins:
+                        row_cts=[]
+                        for b in range(K):
+                            pt = enc.encode(1 if b==idx else 0)
+                            ct = Ciphertext()
+                            t1 = time.perf_counter()
+                            encryptor.encrypt(pt, ct)
+                            t2 = time.perf_counter()
+                            row_cts.append(ct)
+                            rows_enc.append(t2 - t1)
+                        # 暫存起來以便加總
+                        # 我們只需要密文，但為了省 RAM 不存每行；直接累積在 agg 初值
+                    enc_stats = stats(rows_enc)
+                    enc_total = sum(rows_enc)
+                    print("  encrypt total (s): %.6f   per-ct median/mean/p90: %.6f %.6f %.6f" %
+                          (enc_total, enc_stats["median_s"], enc_stats["mean_s"], enc_stats["p90_s"]))
+                    row("agg_hist_encrypt_per_ct", enc_stats)
+                    rows.append({"scheme":"BFV","op":"agg_hist_encrypt_total","total_s":enc_total,"K":K,"n":len(bins)})
+
+                    # 2) 重新生成同樣的 one-hot 並做伺服器相加（計時）
+                    def enc_one_hot(idx, K):
+                        row=[]
+                        for b in range(K):
+                            pt = enc.encode(1 if b==idx else 0)
+                            ct = Ciphertext()
+                            encryptor.encrypt(pt, ct)
+                            row.append(ct)
+                        return row
+                    # 初值
+                    first = enc_one_hot(bins[0], K)
+                    H = [first[b] for b in range(K)]
+                    t_add0 = time.perf_counter()
+                    for idx in bins[1:]:
+                        r = enc_one_hot(idx, K)
+                        for b in range(K):
+                            out = Ciphertext()
+                            evaluator.add(H[b], r[b], out)
+                            H[b] = out
+                    add_total = time.perf_counter() - t_add0
+                    print("  server-add total (s): %.6f  (adds=%d per bin)" % (add_total, max(0,len(bins)-1)))
+                    rows.append({"scheme":"BFV","op":"agg_hist_server_add_total","total_s":add_total,"n_adds_per_bin":max(0,len(bins)-1),"K":K})
+
+                    # 解密所有 bin（計時）
+                    t_dec0 = time.perf_counter()
+                    hist = []
+                    for b in range(K):
+                        pt = Plaintext(); decryptor.decrypt(H[b], pt)
+                        hist.append(try_decode_int(enc, pt))
+                    dec_total = time.perf_counter() - t_dec0
+                    true_hist = [bins.count(b) for b in range(K)]
+                    print("  decrypt all bins (s): %.6f  | HE hist=%s  vs true=%s" % (dec_total, hist, true_hist))
+                    rows.append({"scheme":"BFV","op":"agg_hist_decrypt_total","total_s":dec_total,"K":K})
 
         except Exception as e:
             print("[ BFV ] ERROR:", e)
