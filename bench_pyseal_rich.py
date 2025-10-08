@@ -81,6 +81,56 @@ def try_decode_int(encoder, plain) -> Optional[int]:
     except Exception:
         return None
 
+# ===== DP helpers =====
+import random, math, time
+
+def _laplace(scale: float) -> float:
+    u = random.random() - 0.5
+    return -scale * math.copysign(math.log(1 - 2*abs(u)), u)
+
+def _gaussian(sigma: float) -> float:
+    return random.gauss(0.0, sigma)
+
+def _clip_list(xs, a, b):
+    a, b = float(a), float(b)
+    return [a if x < a else b if x > b else float(x) for x in xs]
+
+def dp_sum_once(vals, a, b, epsilon, mech="laplace", delta=1e-5):
+    X = _clip_list(vals, a, b)
+    true = float(sum(X))
+    if mech == "laplace":
+        noisy = true + _laplace((b - a)/epsilon)
+    else:
+        sigma = math.sqrt(2.0*math.log(1.25/delta)) * (b - a) / epsilon
+        noisy = true + _gaussian(sigma)
+    return noisy, true
+
+def dp_mean_once(vals, a, b, epsilon, mech="laplace", delta=1e-5):
+    X = _clip_list(vals, a, b)
+    true = float(sum(X))/len(X)
+    if mech == "laplace":
+        noisy = true + _laplace(((b - a)/len(X))/epsilon)
+    else:
+        sigma = math.sqrt(2.0*math.log(1.25/delta)) * ((b - a)/len(X)) / epsilon
+        noisy = true + _gaussian(sigma)
+    return noisy, true
+
+def dp_hist_once(bins, K, epsilon, mech="laplace", delta=1e-5):
+    counts = [0]*K
+    for t in bins: counts[t] += 1
+    if mech == "laplace":
+        noisy = [c + _laplace(1.0/epsilon) for c in counts]
+    else:
+        sigma = math.sqrt(2.0*math.log(1.25/delta)) * (1.0/epsilon)
+        noisy = [c + _gaussian(sigma) for c in counts]
+    return noisy, counts
+
+def _summ_mae_rmse(errs):
+    n = len(errs)
+    mae  = sum(abs(e) for e in errs)/n if n else float("nan")
+    rmse = math.sqrt(sum((e*e) for e in errs)/n) if n else float("nan")
+    return mae, rmse
+
 # ---- HE aggregation helpers (legacy-friendly) ----
 def he_encrypt_int(enc, encryptor, v:int):
     pt = enc.encode(int(v))
@@ -497,13 +547,25 @@ def collect_metadata(args, bfv_env=None, ckks_present=False):
             "bfv_plain_mod": args.plain_mod,
             "coeff_mod_bits": args.coeff_bits,
             "scale_bits": args.scale_bits,
-            "dp_epsilon": args.dp_epsilon,
             "run_scheme": args.scheme
         },
         "os_release": read_os_release(),
         "cpuinfo": read_cpuinfo_summary(),
         "env_selected": {k: os.environ.get(k) for k in ["PYTHONPATH","LD_LIBRARY_PATH","PATH","HOME","PWD"]},
         "ckks_present": bool(ckks_present),
+        "dp_config": {
+            "enabled": args.dp != "none",
+            "mode": args.dp,                     # sum / mean / hist / all
+            "mech": args.dp_mech,               # laplace / gaussian
+            "eps_string": args.dp_eps,          # e.g. "0.5,1,2,4"
+            "eps_list": [float(e.strip()) for e in str(args.dp_eps).split(",") if e.strip()],
+            "delta": args.dp_delta,
+            "repeats": args.dp_repeats,
+            "clip_a": args.clip_a,
+            "clip_b": args.clip_b,
+            # backward-compat: 舊欄位（若不存在就設 None）
+            "dp_epsilon_legacy": getattr(args, "dp_epsilon", None)
+        },
     }
     if bfv_env:
         md["keygen_time_s"] = bfv_env.get("keygen_time_s")
@@ -519,7 +581,6 @@ def main():
     ap.add_argument("--coeff-bits", type=int, default=2048)
     ap.add_argument("--plain-mod", type=int, default=(1<<16))
     ap.add_argument("--scale-bits", type=int, default=40)
-    ap.add_argument("--dp-epsilon", type=float, default=1.0)
     ap.add_argument("--csv", default="pyseal_benchmark_results.csv", help="Output CSV file for timings.")
     ap.add_argument("--meta", default="run_metadata.json", help="Output JSON file for run metadata.")
     ap.add_argument("--dump-env", default=None, help="If set, write ALL environment variables to this JSON path.")
@@ -528,6 +589,13 @@ def main():
     ap.add_argument("--agg-max-value", type=int, default=50, help="Each user's value is in [0, agg-max-value].")
     ap.add_argument("--agg-bins", type=int, default=8, help="Number of histogram bins (no BatchEncoder version).")
     ap.add_argument("--agg-seed", type=int, default=123, help="Random seed for reproducibility.")
+    ap.add_argument("--dp", choices=["none", "sum", "mean", "hist", "all"], default="none", help="Run Differential Privacy baselines for sum/mean/hist.")
+    ap.add_argument("--dp-mech", choices=["laplace", "gaussian"], default="laplace", help="DP mechanism: Laplace (ε) or Gaussian (ε,δ).")
+    ap.add_argument("--dp-eps", type=str, default="1.0", help="Comma-separated epsilons, e.g. '0.5,1,2,4'.")
+    ap.add_argument("--dp-delta", type=float, default=1e-5, help="δ for Gaussian mechanism (ignored for Laplace).")
+    ap.add_argument("--dp-repeats", type=int, default=1000, help="Monte-Carlo repeats per epsilon for error stats.")
+    ap.add_argument("--clip-a", type=float, default=0.0, help="Clip lower bound for per-user value (sum/mean).")
+    ap.add_argument("--clip-b", type=float, default=50.0, help="Clip upper bound for per-user value (sum/mean). Should match your agg-max-value.")
     args = ap.parse_args()
 
     rows = []
@@ -695,6 +763,82 @@ def main():
                     true_hist = [bins.count(b) for b in range(K)]
                     print("  decrypt all bins (s): %.6f  | HE hist=%s  vs true=%s" % (dec_total, hist, true_hist))
                     rows.append({"scheme":"BFV","op":"agg_hist_decrypt_total","total_s":dec_total,"K":K})
+                    
+            # ===== DP baselines (central DP) =====
+            if args.dp != "none":
+                print("\n[DP] baselines...")
+
+                # 與 HE 用同一份資料；若沒有，就現生
+                try:
+                    vals
+                except NameError:
+                    random.seed(args.agg_seed)
+                    vals = [random.randint(0, args.agg_max_value) for _ in range(args.agg_n_users)]
+                try:
+                    bins
+                except NameError:
+                    random.seed(args.agg_seed+1)
+                    bins = [random.randrange(args.agg_bins) for _ in range(args.agg_n_users)]
+
+                eps_list = [float(e.strip()) for e in args.dp_eps.split(",") if e.strip()]
+                mech = args.dp_mech
+                a, b = args.clip_a, args.clip_b
+                n, K = len(vals), args.agg_bins
+
+                def tstats(ts):
+                    ts = sorted(ts); m=len(ts)
+                    return {
+                        "median_s": ts[m//2] if m else float("nan"),
+                        "mean_s": sum(ts)/m if m else float("nan"),
+                        "p90_s": ts[int(0.9*(m-1))] if m else float("nan"),
+                        "repeat": m
+                    }
+
+                for eps in eps_list:
+                    if args.dp in ("sum","all"):
+                        errs, t_noise = [], []
+                        for _ in range(args.dp_repeats):
+                            t0 = time.perf_counter()
+                            noisy, true_ = dp_sum_once(vals, a, b, eps, mech, args.dp_delta)
+                            t_noise.append(time.perf_counter() - t0)
+                            errs.append(noisy - true_)
+                        mae, rmse = _summ_mae_rmse(errs); st = tstats(t_noise)
+                        print(f"  [SUM] ε={eps:g}  MAE={mae:.3e} RMSE={rmse:.3e}  "
+                              f"time med/mean/p90: {st['median_s']:.6f} {st['mean_s']:.6f} {st['p90_s']:.6f}")
+                        rows.append({"scheme":"DP","op":"dp_sum","mech":mech,"epsilon":eps,
+                                     "clip_a":a,"clip_b":b,"delta":args.dp_delta,
+                                     "mae":mae,"rmse":rmse,"repeat":args.dp_repeats,"n":n,
+                                     "t_median_s":st["median_s"],"t_mean_s":st["mean_s"],"t_p90_s":st["p90_s"]})
+
+                    if args.dp in ("mean","all"):
+                        errs, t_noise = [], []
+                        for _ in range(args.dp_repeats):
+                            t0 = time.perf_counter()
+                            noisy, true_ = dp_mean_once(vals, a, b, eps, mech, args.dp_delta)
+                            t_noise.append(time.perf_counter() - t0)
+                            errs.append(noisy - true_)
+                        mae, rmse = _summ_mae_rmse(errs); st = tstats(t_noise)
+                        print(f"  [MEAN] ε={eps:g} MAE={mae:.3e} RMSE={rmse:.3e}  "
+                              f"time med/mean/p90: {st['median_s']:.6f} {st['mean_s']:.6f} {st['p90_s']:.6f}")
+                        rows.append({"scheme":"DP","op":"dp_mean","mech":mech,"epsilon":eps,
+                                     "clip_a":a,"clip_b":b,"delta":args.dp_delta,
+                                     "mae":mae,"rmse":rmse,"repeat":args.dp_repeats,"n":n,
+                                     "t_median_s":st["median_s"],"t_mean_s":st["mean_s"],"t_p90_s":st["p90_s"]})
+
+                    if args.dp in ("hist","all"):
+                        errs_flat, t_noise = [], []
+                        for _ in range(args.dp_repeats):
+                            t0 = time.perf_counter()
+                            noisy, true_ = dp_hist_once(bins, K, eps, mech, args.dp_delta)
+                            t_noise.append(time.perf_counter() - t0)
+                            errs_flat.extend((noisy[i] - true_[i]) for i in range(K))
+                        mae, rmse = _summ_mae_rmse(errs_flat); st = tstats(t_noise)
+                        print(f"  [HIST] ε={eps:g} MAE={mae:.3e} RMSE={rmse:.3e}  "
+                              f"time med/mean/p90: {st['median_s']:.6f} {st['mean_s']:.6f} {st['p90_s']:.6f}")
+                        rows.append({"scheme":"DP","op":"dp_hist","mech":mech,"epsilon":eps,
+                                     "delta":args.dp_delta,"repeat":args.dp_repeats,"K":K,"n":n,
+                                     "mae":mae,"rmse":rmse,
+                                     "t_median_s":st["median_s"],"t_mean_s":st["mean_s"],"t_p90_s":st["p90_s"]})
 
         except Exception as e:
             print("[ BFV ] ERROR:", e)
@@ -725,19 +869,6 @@ def main():
             print("[ CKKS ] ERROR (skipping):", e)
     elif args.scheme in ("ckks","all"):
         print("\n[ CKKS ] Encoder not found in this PySEAL build. Skipping CKKS.")
-
-    # DP baseline
-    if args.scheme in ("all",):
-        print("\n[ DP ] baseline...")
-        values = [random.uniform(-5, 5) for _ in range(1000)]
-        true_sum = sum(values)
-        errs = [abs(dp_release_sum(values, args.dp_epsilon) - true_sum) for _ in range(max(100, args.repeat))]
-        mae = sum(errs)/len(errs)
-        rmse = math.sqrt(sum(e*e for e in errs) / len(errs))
-        t = bench(lambda: dp_release_sum(values, args.dp_epsilon), repeat=args.repeat)
-        print("  epsilon =", args.dp_epsilon, " MAE=%.3e RMSE=%.3e" % (mae, rmse))
-        print("  timing  median/mean/p90 (s):", fmt(t['median_s']), fmt(t['mean_s']), fmt(t['p90_s']))
-        rows.append({"scheme":"DP","op":"release_sum","median_s":t["median_s"],"mean_s":t["mean_s"],"p90_s":t["p90_s"],"repeat":t["repeat"],"epsilon":args.dp_epsilon})
 
     # Write CSV
     if rows:
